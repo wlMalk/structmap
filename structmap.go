@@ -228,14 +228,6 @@ type (
 	AliasFunc   func(name string, path string) string
 )
 
-// tag to get name from
-// omitempty
-// namer func
-// omit func
-// aliases
-
-// flatten
-
 func newCache() *cache {
 	return &cache{
 		infos: map[reflect.Type]*structInfo{},
@@ -271,11 +263,14 @@ func (m *Mapper) Map(s interface{}, ifn IncludeFunc, afn AliasFunc) (*orderedmap
 
 func (m *Mapper) mapInto(s interface{}, om *orderedmap.OrderedMap, path string, ifn IncludeFunc, afn AliasFunc) error {
 	if s == nil {
-		return errors.New("value is nil")
+		return nil
 	}
 
 	v := iv(reflect.ValueOf(s))
 	t := it(reflect.TypeOf(s))
+	if !v.IsValid() {
+		return nil
+	}
 	if v.Kind() != reflect.Struct {
 		return errors.New("value not a struct or pointer to a struct")
 	}
@@ -288,8 +283,6 @@ func (m *Mapper) mapInto(s interface{}, om *orderedmap.OrderedMap, path string, 
 		tField := it(f.typ)
 		key := f.alias
 
-		// included := ifn == nil || )
-
 		if !f.merge && ifn != nil && !ifn(key, path, f.tag) {
 			continue
 		}
@@ -300,31 +293,15 @@ func (m *Mapper) mapInto(s interface{}, om *orderedmap.OrderedMap, path string, 
 				if err != nil {
 					return err
 				}
+			} else if f.whole {
+				m.set(m.aliasOr(key, path, afn), vField, om, f)
 			} else {
-				if f.whole {
-					m.set(m.aliasOr(key, path, afn), vField, om, f)
-				} else {
-					mn := orderedmap.New()
-					err = m.mapInto(vField.Interface(), mn, join(path, key), ifn, afn)
-					if err != nil {
-						return err
-					}
-					m.setOrderedMap(m.aliasOr(key, path, afn), mn, om, f)
-				}
-			}
-		} else if f.collectionOfStructs {
-			if tField.Kind() == reflect.Array || tField.Kind() == reflect.Slice {
-				a, err := m.extractSlice(tField, vField, f, join(path, key), ifn, afn)
+				mn := orderedmap.New()
+				err = m.mapInto(vField.Interface(), mn, join(path, key), ifn, afn)
 				if err != nil {
 					return err
 				}
-				m.setSlice(m.aliasOr(key, path, afn), a, om, f)
-			} else if tField.Kind() == reflect.Map {
-				a, err := m.extractMap(tField, vField, f, join(path, key), ifn, afn)
-				if err != nil {
-					return err
-				}
-				m.setMap(m.aliasOr(key, path, afn), a, om, f)
+				m.setOrderedMap(m.aliasOr(key, path, afn), mn, om, f)
 			}
 		} else if f.merge && !f.whole && vField.Kind() == reflect.Map {
 			for _, k := range vField.MapKeys() {
@@ -335,21 +312,19 @@ func (m *Mapper) mapInto(s interface{}, om *orderedmap.OrderedMap, path string, 
 				m.set(m.aliasOr(mkey, path, afn), vField.MapIndex(k), om, f)
 			}
 		} else if tField.Kind() == reflect.Array || tField.Kind() == reflect.Slice {
-			a, err := m.extractSliceValues(tField, vField, f, join(path, key), ifn, afn)
+			a, err := m.extractSlice(tField, vField, f, join(path, key), ifn, afn)
 			if err != nil {
 				return err
 			}
 			m.setSlice(m.aliasOr(key, path, afn), a, om, f)
 		} else if tField.Kind() == reflect.Map {
-			a, err := m.extractMapValues(tField, vField, f, join(path, key), ifn, afn)
+			a, err := m.extractMap(tField, vField, f, join(path, key), ifn, afn)
 			if err != nil {
 				return err
 			}
 			m.setMap(m.aliasOr(key, path, afn), a, om, f)
 		} else {
-			// if included {
 			m.set(m.aliasOr(key, path, afn), vField, om, f)
-			// }
 		}
 	}
 	return nil
@@ -374,8 +349,8 @@ func (m *Mapper) extractMap(t reflect.Type, v reflect.Value, f *fieldInfo, path 
 			if err != nil {
 				return nil, err
 			}
-			if f.omitEmpty && len(mn.Keys()) == 0 {
-				continue
+			if len(mn.Keys()) == 0 {
+				mn = nil
 			}
 			a[m.aliasOr(key, path, afn)] = mn
 		}
@@ -420,6 +395,18 @@ func (m *Mapper) extractMap(t reflect.Type, v reflect.Value, f *fieldInfo, path 
 			}
 			a[m.aliasOr(key, path, afn)] = mn
 		}
+	} else {
+		for _, k := range v.MapKeys() {
+			key := m.nameOr(fmt.Sprint(k))
+			if ifn != nil && !ifn(key, path, f.tag) {
+				continue
+			}
+			vk := v.MapIndex(k)
+			if !vk.CanInterface() {
+				continue
+			}
+			a[m.aliasOr(key, path, afn)] = vk.Interface()
+		}
 	}
 	return a, nil
 }
@@ -438,8 +425,8 @@ func (m *Mapper) extractSlice(t reflect.Type, v reflect.Value, f *fieldInfo, pat
 			if err != nil {
 				return nil, err
 			}
-			if f.omitEmpty && len(mn.Keys()) == 0 {
-				continue
+			if len(mn.Keys()) == 0 {
+				mn = nil
 			}
 			a = append(a, mn)
 		}
@@ -474,114 +461,10 @@ func (m *Mapper) extractSlice(t reflect.Type, v reflect.Value, f *fieldInfo, pat
 			}
 			a = append(a, mp)
 		}
-	}
-	return a, nil
-}
-
-func (m *Mapper) extractMapValues(t reflect.Type, v reflect.Value, f *fieldInfo, path string, ifn IncludeFunc, afn AliasFunc) (map[string]interface{}, error) {
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-		v = v.Elem()
-	}
-	a := map[string]interface{}{}
-	if t.Elem().Kind() == reflect.Slice || t.Elem().Kind() == reflect.Array || (t.Elem().Kind() == reflect.Ptr &&
-		(t.Elem().Elem().Kind() == reflect.Slice || t.Elem().Elem().Kind() == reflect.Array)) {
-		for _, k := range v.MapKeys() {
-			key := m.nameOr(fmt.Sprint(k))
-			mPath := join(path, key)
-			if ifn != nil && !ifn(key, path, f.tag) {
-				continue
-			}
-			vk := iv(v.MapIndex(k))
-			if f.omitEmpty && vk.Len() == 0 {
-				continue
-			}
-			sl, err := m.extractSliceValues(vk.Type(), vk, f, mPath, ifn, afn)
-			if err != nil {
-				return nil, err
-			}
-			if f.omitEmpty && len(sl) == 0 {
-				continue
-			}
-			a[m.aliasOr(key, path, afn)] = sl
-		}
-	} else if t.Elem().Kind() == reflect.Map || (t.Elem().Kind() == reflect.Ptr && t.Elem().Elem().Kind() == reflect.Map) {
-		for _, k := range v.MapKeys() {
-			key := m.nameOr(fmt.Sprint(k))
-			mPath := join(path, key)
-			if ifn != nil && !ifn(key, path, f.tag) {
-				continue
-			}
-			vk := iv(v.MapIndex(k))
-			if f.omitEmpty && vk.Len() == 0 {
-				continue
-			}
-			mn, err := m.extractMapValues(vk.Type(), vk, f, mPath, ifn, afn)
-			if err != nil {
-				return nil, err
-			}
-			if f.omitEmpty && len(mn) == 0 {
-				continue
-			}
-			a[m.aliasOr(key, path, afn)] = mn
-		}
-	} else {
-		for _, k := range v.MapKeys() {
-			key := m.nameOr(fmt.Sprint(k))
-			if ifn != nil && !ifn(key, path, f.tag) {
-				continue
-			}
-			vk := v.MapIndex(k)
-			if f.omitEmpty && (vk.IsZero() || !vk.CanInterface()) {
-				continue
-			}
-			a[m.aliasOr(key, path, afn)] = vk.Interface()
-		}
-	}
-	return a, nil
-}
-
-func (m *Mapper) extractSliceValues(t reflect.Type, v reflect.Value, f *fieldInfo, path string, ifn IncludeFunc, afn AliasFunc) ([]interface{}, error) {
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-		v = v.Elem()
-	}
-	a := make([]interface{}, 0, v.Len())
-	if t.Elem().Kind() == reflect.Slice || t.Elem().Kind() == reflect.Array || (t.Elem().Kind() == reflect.Ptr &&
-		(t.Elem().Elem().Kind() == reflect.Slice || t.Elem().Elem().Kind() == reflect.Array)) {
-		for i := 0; i < v.Len(); i++ {
-			vi := iv(v.Index(i))
-			if f.omitEmpty && vi.Len() == 0 {
-				continue
-			}
-			sl, err := m.extractSliceValues(vi.Type(), vi, f, join(path, "*"), ifn, afn)
-			if err != nil {
-				return nil, err
-			}
-			if f.omitEmpty && len(sl) == 0 {
-				continue
-			}
-			a = append(a, sl)
-		}
-	} else if t.Elem().Kind() == reflect.Map || (t.Elem().Kind() == reflect.Ptr && t.Elem().Elem().Kind() == reflect.Map) {
-		for i := 0; i < v.Len(); i++ {
-			vi := iv(v.Index(i))
-			if f.omitEmpty && vi.Len() == 0 {
-				continue
-			}
-			mp, err := m.extractMapValues(vi.Type(), vi, f, join(path, "*"), ifn, afn)
-			if err != nil {
-				return nil, err
-			}
-			if f.omitEmpty && len(mp) == 0 {
-				continue
-			}
-			a = append(a, mp)
-		}
 	} else {
 		for i := 0; i < v.Len(); i++ {
 			vi := v.Index(i)
-			if f.omitEmpty && (vi.IsZero() || !vi.CanInterface()) {
+			if !vi.CanInterface() {
 				continue
 			}
 			a = append(a, vi.Interface())
